@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 
+	"github.com/libp2p/go-libp2p/core/network"
 	tpt "github.com/libp2p/go-libp2p/core/transport"
 	ma "github.com/multiformats/go-multiaddr"
 	udx "github.com/stephanfeb/go-udx"
@@ -19,8 +20,17 @@ type listener struct {
 var _ tpt.Listener = (*listener)(nil)
 
 func (l *listener) Accept() (tpt.CapableConn, error) {
-	udxConn, err := l.mux.Accept(context.Background())
+	ctx := context.Background()
+
+	udxConn, err := l.mux.Accept(ctx)
 	if err != nil {
+		return nil, err
+	}
+
+	// Accept stream 0 from the dialer (the upgrade stream)
+	stream0, err := udxConn.AcceptStream(ctx)
+	if err != nil {
+		udxConn.Close()
 		return nil, err
 	}
 
@@ -30,13 +40,22 @@ func (l *listener) Accept() (tpt.CapableConn, error) {
 		remoteMaddr, _ = toUDXMultiaddr(udpAddr.IP.String(), udpAddr.Port)
 	}
 
-	return &conn{
-		udxConn:     udxConn,
-		transport:   l.transport,
-		localPeer:   l.transport.localPeer,
+	rawConn := &streamConn{
+		stream:      stream0,
+		connection:  udxConn,
 		localMaddr:  l.laddr,
 		remoteMaddr: remoteMaddr,
-	}, nil
+	}
+
+	// Get a connection scope from the resource manager
+	connScope, err := l.transport.rcmgr.OpenConnection(network.DirInbound, false, remoteMaddr)
+	if err != nil {
+		rawConn.Close()
+		return nil, err
+	}
+
+	// Upgrader handles inbound Noise + Yamux negotiation
+	return l.transport.upgrader.Upgrade(ctx, l.transport, rawConn, network.DirInbound, "", connScope)
 }
 
 func (l *listener) Close() error {

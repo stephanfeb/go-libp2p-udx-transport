@@ -2,18 +2,26 @@ package udxtransport
 
 import (
 	"context"
+	"crypto/rand"
+	"fmt"
 	"io"
 	"testing"
 	"time"
 
 	ic "github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/sec"
+	tpt "github.com/libp2p/go-libp2p/core/transport"
+	"github.com/libp2p/go-libp2p/p2p/muxer/yamux"
+	"github.com/libp2p/go-libp2p/p2p/net/upgrader"
+	"github.com/libp2p/go-libp2p/p2p/security/noise"
 	ma "github.com/multiformats/go-multiaddr"
 )
 
 func generateKey(t *testing.T) (ic.PrivKey, peer.ID) {
 	t.Helper()
-	priv, _, err := ic.GenerateEd25519Key(nil)
+	priv, _, err := ic.GenerateEd25519Key(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -24,9 +32,36 @@ func generateKey(t *testing.T) (ic.PrivKey, peer.ID) {
 	return priv, id
 }
 
+func createUpgrader(t *testing.T, key ic.PrivKey) tpt.Upgrader {
+	t.Helper()
+
+	muxers := []upgrader.StreamMuxer{{
+		ID:    yamux.ID,
+		Muxer: yamux.DefaultTransport,
+	}}
+
+	noiseTpt, err := noise.New(noise.ID, key, muxers)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	u, err := upgrader.New(
+		[]sec.SecureTransport{noiseTpt},
+		muxers,
+		nil,
+		&network.NullResourceManager{},
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return u
+}
+
 func TestCanDial(t *testing.T) {
 	key, _ := generateKey(t)
-	tr, err := NewTransport(key, nil)
+	u := createUpgrader(t, key)
+	tr, err := NewTransport(key, u, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,7 +79,8 @@ func TestCanDial(t *testing.T) {
 
 func TestProtocols(t *testing.T) {
 	key, _ := generateKey(t)
-	tr, _ := NewTransport(key, nil)
+	u := createUpgrader(t, key)
+	tr, _ := NewTransport(key, u, nil)
 
 	protos := tr.Protocols()
 	if len(protos) != 1 || protos[0] != P_UDX {
@@ -54,7 +90,8 @@ func TestProtocols(t *testing.T) {
 
 func TestProxy(t *testing.T) {
 	key, _ := generateKey(t)
-	tr, _ := NewTransport(key, nil)
+	u := createUpgrader(t, key)
+	tr, _ := NewTransport(key, u, nil)
 	if tr.Proxy() {
 		t.Fatal("UDX is not a proxy transport")
 	}
@@ -64,8 +101,9 @@ func TestListenAndDial(t *testing.T) {
 	serverKey, serverID := generateKey(t)
 	clientKey, _ := generateKey(t)
 
-	// Create server transport and listen
-	serverTr, err := NewTransport(serverKey, nil)
+	// Create server transport with Noise + Yamux upgrader
+	serverU := createUpgrader(t, serverKey)
+	serverTr, err := NewTransport(serverKey, serverU, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,29 +118,35 @@ func TestListenAndDial(t *testing.T) {
 	actualAddr := ln.Multiaddr()
 	t.Logf("Listening on %s", actualAddr)
 
-	// Create client transport and dial
-	clientTr, err := NewTransport(clientKey, nil)
+	// Create client transport with Noise + Yamux upgrader
+	clientU := createUpgrader(t, clientKey)
+	clientTr, err := NewTransport(clientKey, clientU, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// Accept in background
-	acceptDone := make(chan error, 1)
+	// Accept in background — server conn kept alive until test ends
+	type serverResult struct {
+		conn tpt.CapableConn
+		err  error
+	}
+	echoDone := make(chan error, 1)
+	serverReady := make(chan serverResult, 1)
 	go func() {
 		serverConn, err := ln.Accept()
 		if err != nil {
-			acceptDone <- err
+			serverReady <- serverResult{nil, fmt.Errorf("accept conn: %w", err)}
 			return
 		}
-		defer serverConn.Close()
+		serverReady <- serverResult{serverConn, nil}
 
-		// Accept a stream
+		// Accept a stream (this is a Yamux stream now)
 		s, err := serverConn.AcceptStream()
 		if err != nil {
-			acceptDone <- err
+			echoDone <- fmt.Errorf("accept stream: %w", err)
 			return
 		}
 
@@ -110,24 +154,34 @@ func TestListenAndDial(t *testing.T) {
 		buf := make([]byte, 1024)
 		n, err := s.Read(buf)
 		if err != nil && err != io.EOF {
-			acceptDone <- err
+			echoDone <- fmt.Errorf("read: %w", err)
 			return
 		}
 		_, err = s.Write(buf[:n])
 		if err != nil {
-			acceptDone <- err
+			echoDone <- err
 			return
 		}
 		s.Close()
-		acceptDone <- nil
+		echoDone <- nil
 	}()
 
 	// Dial
 	clientConn, err := clientTr.Dial(ctx, actualAddr, serverID)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatal("dial:", err)
 	}
 	defer clientConn.Close()
+
+	t.Log("Dial succeeded, peer:", clientConn.RemotePeer())
+
+	// Wait for server to accept the connection
+	sr := <-serverReady
+	if sr.err != nil {
+		t.Fatal("server accept:", sr.err)
+	}
+	defer sr.conn.Close()
+	t.Log("Server accepted connection")
 
 	// Verify connection properties
 	if clientConn.LocalPeer() != clientTr.localPeer {
@@ -137,16 +191,16 @@ func TestListenAndDial(t *testing.T) {
 		t.Fatal("remote peer mismatch")
 	}
 
-	// Open a stream and send data
+	// Open a stream (Yamux stream) and send data
 	s, err := clientConn.OpenStream(ctx)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatal("open stream:", err)
 	}
 
-	testData := []byte("hello from libp2p over UDX!")
+	testData := []byte("hello from libp2p over UDX with Noise+Yamux!")
 	_, err = s.Write(testData)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatal("write:", err)
 	}
 	s.CloseWrite()
 
@@ -154,23 +208,23 @@ func TestListenAndDial(t *testing.T) {
 	buf := make([]byte, 1024)
 	n, err := s.Read(buf)
 	if err != nil && err != io.EOF {
-		t.Fatal(err)
+		t.Fatal("read echo:", err)
 	}
 	if string(buf[:n]) != string(testData) {
 		t.Fatalf("echo mismatch: got %q, want %q", buf[:n], testData)
 	}
 
-	// Wait for server
+	// Wait for server echo goroutine
 	select {
-	case err := <-acceptDone:
+	case err := <-echoDone:
 		if err != nil {
 			t.Fatalf("server error: %v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("server timed out")
 	}
 
-	t.Log("Listen → Dial → Stream echo test PASSED")
+	t.Log("Listen → Dial → Noise → Yamux → Stream echo test PASSED")
 }
 
 func TestMultiaddr(t *testing.T) {

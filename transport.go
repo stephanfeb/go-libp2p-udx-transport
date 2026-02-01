@@ -17,13 +17,15 @@ import (
 type Transport struct {
 	privKey   ic.PrivKey
 	localPeer peer.ID
+	upgrader  tpt.Upgrader
 	rcmgr     network.ResourceManager
 }
 
 var _ tpt.Transport = (*Transport)(nil)
 
-// NewTransport creates a new UDX transport.
-func NewTransport(key ic.PrivKey, rcmgr network.ResourceManager) (*Transport, error) {
+// NewTransport creates a new UDX transport with the given upgrader.
+// The upgrader handles security (Noise) and stream muxing (Yamux).
+func NewTransport(key ic.PrivKey, u tpt.Upgrader, rcmgr network.ResourceManager) (*Transport, error) {
 	localPeer, err := peer.IDFromPrivateKey(key)
 	if err != nil {
 		return nil, fmt.Errorf("deriving peer ID: %w", err)
@@ -36,6 +38,7 @@ func NewTransport(key ic.PrivKey, rcmgr network.ResourceManager) (*Transport, er
 	return &Transport{
 		privKey:   key,
 		localPeer: localPeer,
+		upgrader:  u,
 		rcmgr:     rcmgr,
 	}, nil
 }
@@ -53,11 +56,11 @@ func (t *Transport) Dial(ctx context.Context, raddr ma.Multiaddr, p peer.ID) (tp
 	}
 
 	// Bind local UDP socket (match address family of remote)
-	network := "udp4"
+	udpNetwork := "udp4"
 	if remoteAddr.IP.To4() == nil {
-		network = "udp6"
+		udpNetwork = "udp6"
 	}
-	localConn, err := net.ListenUDP(network, nil)
+	localConn, err := net.ListenUDP(udpNetwork, nil)
 	if err != nil {
 		return nil, fmt.Errorf("binding local socket: %w", err)
 	}
@@ -69,18 +72,33 @@ func (t *Transport) Dial(ctx context.Context, raddr ma.Multiaddr, p peer.ID) (tp
 		return nil, fmt.Errorf("dialing: %w", err)
 	}
 
+	// Open stream 0 as the raw connection for the upgrader
+	stream0, err := udxConn.OpenStream(ctx)
+	if err != nil {
+		mux.Close()
+		return nil, fmt.Errorf("opening upgrade stream: %w", err)
+	}
+
 	// Build local multiaddr
 	localUDP := localConn.LocalAddr().(*net.UDPAddr)
 	localMaddr, _ := toUDXMultiaddr(localUDP.IP.String(), localUDP.Port)
 
-	return &conn{
-		udxConn:     udxConn,
-		transport:   t,
-		localPeer:   t.localPeer,
-		remotePeer:  p,
+	rawConn := &streamConn{
+		stream:      stream0,
+		connection:  udxConn,
 		localMaddr:  localMaddr,
 		remoteMaddr: raddr,
-	}, nil
+	}
+
+	// Get a connection scope from the resource manager
+	connScope, err := t.rcmgr.OpenConnection(network.DirOutbound, false, raddr)
+	if err != nil {
+		rawConn.Close()
+		return nil, fmt.Errorf("resource manager: %w", err)
+	}
+
+	// Upgrader handles Noise + Yamux negotiation
+	return t.upgrader.Upgrade(ctx, t, rawConn, network.DirOutbound, p, connScope)
 }
 
 // Listen listens for incoming UDX connections.
