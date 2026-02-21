@@ -55,7 +55,12 @@ func (l *listener) Accept() (tpt.CapableConn, error) {
 	}
 
 	// Upgrader handles inbound Noise + Yamux negotiation
-	return l.transport.upgrader.Upgrade(ctx, l.transport, rawConn, network.DirInbound, "", connScope)
+	conn, err := l.transport.upgrader.Upgrade(ctx, l.transport, rawConn, network.DirInbound, "", connScope)
+	if err != nil {
+		rawConn.Close()
+		return nil, err
+	}
+	return conn, nil
 }
 
 func (l *listener) Close() error {

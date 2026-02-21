@@ -2,6 +2,7 @@ package udxtransport
 
 import (
 	"fmt"
+	"net"
 	"strconv"
 
 	ma "github.com/multiformats/go-multiaddr"
@@ -64,7 +65,11 @@ func fromUDXMultiaddr(addr ma.Multiaddr) (host string, port int, err error) {
 	return hostStr, port, nil
 }
 
-// toUDXMultiaddr creates a /ip4/<host>/udp/<port>/udx multiaddr.
+// toUDXMultiaddr creates a /ip4/<host>/udp/<port>/udx or /ip6/<host>/udp/<port>/udx multiaddr.
 func toUDXMultiaddr(host string, port int) (ma.Multiaddr, error) {
-	return ma.NewMultiaddr(fmt.Sprintf("/ip4/%s/udp/%d/udx", host, port))
+	proto := "ip4"
+	if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
+		proto = "ip6"
+	}
+	return ma.NewMultiaddr(fmt.Sprintf("/%s/%s/udp/%d/udx", proto, host, port))
 }

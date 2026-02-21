@@ -113,7 +113,12 @@ func (t *Transport) Listen(laddr ma.Multiaddr) (tpt.Listener, error) {
 		return nil, fmt.Errorf("resolving address: %w", err)
 	}
 
-	udpConn, err := net.ListenUDP("udp", udpAddr)
+	// Explicitly select address family to avoid dual-stack surprises on Linux.
+	udpNetwork := "udp4"
+	if udpAddr.IP.To4() == nil {
+		udpNetwork = "udp6"
+	}
+	udpConn, err := net.ListenUDP(udpNetwork, udpAddr)
 	if err != nil {
 		return nil, fmt.Errorf("listening: %w", err)
 	}
