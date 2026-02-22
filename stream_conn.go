@@ -1,6 +1,7 @@
 package udxtransport
 
 import (
+	"log"
 	"net"
 	"time"
 
@@ -23,6 +24,7 @@ func (sc *streamConn) Read(p []byte) (int, error)  { return sc.stream.Read(p) }
 func (sc *streamConn) Write(p []byte) (int, error) { return sc.stream.Write(p) }
 
 func (sc *streamConn) Close() error {
+	log.Printf("[UDX-DIAG] streamConn.Close() remoteAddr=%v", sc.connection.RemoteAddr())
 	sc.stream.Close()
 	return sc.connection.Close()
 }
