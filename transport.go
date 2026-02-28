@@ -97,7 +97,7 @@ func (t *Transport) Dial(ctx context.Context, raddr ma.Multiaddr, p peer.ID) (tp
 		return nil, fmt.Errorf("parsing multiaddr: %w", err)
 	}
 
-	remoteAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", host, port))
+	remoteAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(host, fmt.Sprintf("%d", port)))
 	if err != nil {
 		return nil, fmt.Errorf("resolving address: %w", err)
 	}
@@ -165,7 +165,7 @@ func (t *Transport) Listen(laddr ma.Multiaddr) (tpt.Listener, error) {
 		return nil, fmt.Errorf("parsing multiaddr: %w", err)
 	}
 
-	udpAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", host, port))
+	udpAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(host, fmt.Sprintf("%d", port)))
 	if err != nil {
 		return nil, fmt.Errorf("resolving address: %w", err)
 	}
@@ -186,11 +186,12 @@ func (t *Transport) Listen(laddr ma.Multiaddr) (tpt.Listener, error) {
 	actualAddr := udpConn.LocalAddr().(*net.UDPAddr)
 	actualMaddr, _ := toUDXMultiaddr(actualAddr.IP.String(), actualAddr.Port)
 
-	return &listener{
+	raw := &rawListener{
 		mux:       mux,
 		transport: t,
 		laddr:     actualMaddr,
-	}, nil
+	}
+	return t.upgrader.UpgradeGatedMaListener(t, raw), nil
 }
 
 // CanDial returns true if this transport can dial the given multiaddr.
