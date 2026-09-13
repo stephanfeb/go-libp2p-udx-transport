@@ -4,12 +4,10 @@ go 1.24.6
 
 toolchain go1.24.12
 
-replace github.com/stephanfeb/go-udx => ../go-udx
-
 require (
 	github.com/libp2p/go-libp2p v0.47.0
 	github.com/multiformats/go-multiaddr v0.16.1
-	github.com/stephanfeb/go-udx v0.0.0-00010101000000-000000000000
+	github.com/stephanfeb/go-udx v0.1.0
 )
 
 require (
