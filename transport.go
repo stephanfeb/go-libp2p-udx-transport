@@ -30,6 +30,7 @@ type Transport struct {
 	mu         sync.Mutex
 	outboundV4 *outboundMux // lazily created on first IPv4 dial
 	outboundV6 *outboundMux // lazily created on first IPv6 dial
+	listeners  []*rawListener
 }
 
 var _ tpt.Transport = (*Transport)(nil)
@@ -108,9 +109,22 @@ func (t *Transport) Dial(ctx context.Context, raddr ma.Multiaddr, p peer.ID) (tp
 		udpNetwork = "udp6"
 	}
 
-	mux, localMaddr, err := t.getOutboundMux(udpNetwork)
-	if err != nil {
-		return nil, fmt.Errorf("outbound mux: %w", err)
+	// A hole punch only works if it leaves from the port the peer was told
+	// about, so it goes out through a listener's socket. Other dials keep
+	// the shared ephemeral socket: an uncoordinated packet from the listen
+	// port can leave a NAT mapping that spoils a later punch.
+	var mux *udx.Multiplexer
+	var localMaddr ma.Multiaddr
+	if simOpen, _, _ := network.GetSimultaneousConnect(ctx); simOpen {
+		if l := t.listenerFor(udpNetwork); l != nil {
+			mux, localMaddr = l.mux, l.laddr
+		}
+	}
+	if mux == nil {
+		mux, localMaddr, err = t.getOutboundMux(udpNetwork)
+		if err != nil {
+			return nil, fmt.Errorf("outbound mux: %w", err)
+		}
 	}
 
 	udxConn, err := mux.Dial(ctx, remoteAddr)
@@ -190,8 +204,37 @@ func (t *Transport) Listen(laddr ma.Multiaddr) (tpt.Listener, error) {
 		mux:       mux,
 		transport: t,
 		laddr:     actualMaddr,
+		network:   udpNetwork,
 	}
+	t.mu.Lock()
+	t.listeners = append(t.listeners, raw)
+	t.mu.Unlock()
 	return t.upgrader.UpgradeGatedMaListener(t, raw), nil
+}
+
+// listenerFor returns an open listener on the given UDP network ("udp4" or
+// "udp6"), or nil if there is none.
+func (t *Transport) listenerFor(udpNetwork string) *rawListener {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, l := range t.listeners {
+		if l.network == udpNetwork {
+			return l
+		}
+	}
+	return nil
+}
+
+// removeListener forgets a closed listener.
+func (t *Transport) removeListener(l *rawListener) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for i, x := range t.listeners {
+		if x == l {
+			t.listeners = append(t.listeners[:i], t.listeners[i+1:]...)
+			return
+		}
+	}
 }
 
 // CanDial returns true if this transport can dial the given multiaddr.

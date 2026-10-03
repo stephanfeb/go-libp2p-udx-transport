@@ -18,6 +18,7 @@ type rawListener struct {
 	mux       *udx.Multiplexer
 	transport *Transport
 	laddr     ma.Multiaddr
+	network   string // "udp4" or "udp6"
 }
 
 var _ tpt.GatedMaListener = (*rawListener)(nil)
@@ -69,6 +70,7 @@ func (l *rawListener) Accept() (manet.Conn, network.ConnManagementScope, error) 
 }
 
 func (l *rawListener) Close() error {
+	l.transport.removeListener(l)
 	return l.mux.Close()
 }
 
