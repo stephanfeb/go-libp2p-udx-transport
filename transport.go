@@ -109,14 +109,28 @@ func (t *Transport) Dial(ctx context.Context, raddr ma.Multiaddr, p peer.ID) (tp
 		udpNetwork = "udp6"
 	}
 
-	// A hole punch only works if it leaves from the port the peer was told
-	// about, so it goes out through a listener's socket. Other dials keep
-	// the shared ephemeral socket: an uncoordinated packet from the listen
-	// port can leave a NAT mapping that spoils a later punch.
+	// Dials leave from a listener's socket, as go-libp2p's QUIC transport
+	// does with reuseport. A peer then observes the NAT mapping of the
+	// port this host listens on, and identify reports that address back,
+	// so a host behind NAT learns a public address that others can reach.
+	// From an ephemeral socket the observed address leads nowhere. A hole
+	// punch must also leave from the listen port, because that is the
+	// port the peer punches towards.
+	//
+	// Two dials keep the shared ephemeral socket:
+	//   - The uncoordinated direct dial that go-libp2p's hole puncher
+	//     makes before it punches (force-direct without simultaneous
+	//     connect). The peer's NAT does not expect it, and an unanswered
+	//     packet from our listen port can make that NAT map the peer's
+	//     later punch to a different port.
+	//   - A dial to the listener's own address, which would make the
+	//     socket dial itself.
 	var mux *udx.Multiplexer
 	var localMaddr ma.Multiaddr
-	if simOpen, _, _ := network.GetSimultaneousConnect(ctx); simOpen {
-		if l := t.listenerFor(udpNetwork); l != nil {
+	simOpen, _, _ := network.GetSimultaneousConnect(ctx)
+	forceDirect, _ := network.GetForceDirectDial(ctx)
+	if simOpen || !forceDirect {
+		if l := t.listenerFor(udpNetwork); l != nil && !l.isOwnAddr(remoteAddr) {
 			mux, localMaddr = l.mux, l.laddr
 		}
 	}

@@ -78,6 +78,20 @@ func (l *rawListener) Accept() (manet.Conn, network.ConnManagementScope, error) 
 	}
 }
 
+// isOwnAddr reports whether addr is this listener's own socket: its
+// address, or a loopback or unspecified address with its port when it
+// listens on all interfaces.
+func (l *rawListener) isOwnAddr(addr *net.UDPAddr) bool {
+	local, ok := l.mux.Addr().(*net.UDPAddr)
+	if !ok || local.Port != addr.Port {
+		return false
+	}
+	if local.IP.Equal(addr.IP) {
+		return true
+	}
+	return local.IP.IsUnspecified() && (addr.IP.IsLoopback() || addr.IP.IsUnspecified())
+}
+
 func (l *rawListener) Close() error {
 	l.transport.removeListener(l)
 	return l.mux.Close()
