@@ -3,6 +3,7 @@ package udxtransport
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"testing"
@@ -242,5 +243,40 @@ func TestMultiaddr(t *testing.T) {
 	}
 	if host != "127.0.0.1" || port != 9090 {
 		t.Fatalf("parsed: host=%s port=%d", host, port)
+	}
+}
+
+// A closed listener must report transport.ErrListenerClosed, which the swarm
+// treats as a normal close. Any other error makes the swarm log "swarm
+// listener accept error" every time a host shuts down.
+func TestAcceptAfterCloseReportsListenerClosed(t *testing.T) {
+	key, _ := generateKey(t)
+	tr, err := NewTransport(key, createUpgrader(t, key), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listenAddr, _ := ma.NewMultiaddr("/ip4/127.0.0.1/udp/0/udx")
+	ln, err := tr.Listen(listenAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	accepted := make(chan error, 1)
+	go func() {
+		_, err := ln.Accept()
+		accepted <- err
+	}()
+	time.Sleep(100 * time.Millisecond)
+	if err := ln.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case err := <-accepted:
+		if !errors.Is(err, tpt.ErrListenerClosed) {
+			t.Fatalf("Accept after Close: got %v, want transport.ErrListenerClosed", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Accept did not return after Close")
 	}
 }

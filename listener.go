@@ -2,6 +2,8 @@ package udxtransport
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net"
 
 	"github.com/libp2p/go-libp2p/core/network"
@@ -35,6 +37,13 @@ func (l *rawListener) Accept() (manet.Conn, network.ConnManagementScope, error) 
 
 		udxConn, err := l.mux.Accept(ctx)
 		if err != nil {
+			if errors.Is(err, udx.ErrConnectionClosed) {
+				// Report a closed listener as net.ErrClosed. go-libp2p's
+				// upgrader turns that into transport.ErrListenerClosed, and
+				// the swarm then treats the close as normal instead of
+				// logging "swarm listener accept error" when a host closes.
+				return nil, nil, fmt.Errorf("udx listener: %w", net.ErrClosed)
+			}
 			return nil, nil, err
 		}
 
