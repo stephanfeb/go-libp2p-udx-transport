@@ -3,16 +3,22 @@ package udxtransport
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/p2p/muxer/yamux"
+	"github.com/libp2p/go-libp2p/p2p/security/noise"
 	ma "github.com/multiformats/go-multiaddr"
 )
 
@@ -156,4 +162,76 @@ func TestInteropGoServerDartClient(t *testing.T) {
 	}
 
 	t.Log("Dart → Go libp2p interop PASSED")
+}
+
+const reqRespProto = "/interop/reqresp/1.0.0"
+
+// TestInteropDartRequestResponse checks that a Dart client's request
+// reaches a Go server when the client writes it and closes the stream after
+// the response, as a Ricochet client does. The server reads one
+// length-prefixed frame per stream, as the go-ricochet pipeline does, and
+// counts the streams that end before a whole frame arrives. The server uses
+// go-ricochet's yamux keepalive settings.
+func TestInteropDartRequestResponse(t *testing.T) {
+	ymx := *yamux.DefaultTransport
+	ymx.KeepAliveInterval = 15 * time.Second
+	ymx.ConnectionWriteTimeout = 10 * time.Second
+	server, err := libp2p.New(
+		libp2p.NoTransports,
+		libp2p.Transport(NewTransport),
+		libp2p.Security(noise.ID, noise.New),
+		libp2p.Muxer(yamux.ID, &ymx),
+		libp2p.ListenAddrStrings("/ip4/127.0.0.1/udp/0/udx"),
+		libp2p.ResourceManager(&network.NullResourceManager{}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	var served, short atomic.Int32
+	server.SetStreamHandler(reqRespProto, func(s network.Stream) {
+		defer s.Close()
+		s.SetReadDeadline(time.Now().Add(10 * time.Second))
+		var lenBuf [4]byte
+		if _, err := io.ReadFull(s, lenBuf[:]); err != nil {
+			short.Add(1)
+			t.Logf("stream ended before the length prefix: %v", err)
+			return
+		}
+		body := make([]byte, binary.BigEndian.Uint32(lenBuf[:]))
+		if _, err := io.ReadFull(s, body); err != nil {
+			short.Add(1)
+			t.Logf("stream ended inside the frame: %v", err)
+			return
+		}
+		var req struct{ N int }
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Errorf("bad request %q: %v", body, err)
+			return
+		}
+		resp := []byte(fmt.Sprintf("ok %d", req.N))
+		binary.BigEndian.PutUint32(lenBuf[:], uint32(len(resp)))
+		s.Write(lenBuf[:])
+		s.Write(resp)
+		served.Add(1)
+	})
+
+	target := fmt.Sprintf("%s/p2p/%s", server.Addrs()[0], server.ID())
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	const count = 40
+	client := exec.CommandContext(ctx, "dart", "run", "bin/interop_reqresp_client.dart", target, strconv.Itoa(count))
+	client.Dir = dartLibp2pDir
+	output, err := client.CombinedOutput()
+	t.Logf("[dart-client] %s", output)
+	if err != nil {
+		t.Fatalf("dart client failed: %v", err)
+	}
+	if n := short.Load(); n > 0 {
+		t.Fatalf("%d streams ended before the server read a whole request", n)
+	}
+	if n := served.Load(); n != count {
+		t.Fatalf("server answered %d requests, want %d", n, count)
+	}
 }
