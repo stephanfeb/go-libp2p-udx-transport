@@ -28,6 +28,14 @@ func TestInteropDartServerGoClient(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The server stops when its stdin closes. Keep stdin open until the
+	// test ends; without a pipe, stdin is /dev/null and the server stops
+	// as soon as it is ready.
+	stdin, err := dartServer.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stdin.Close()
 
 	if err := dartServer.Start(); err != nil {
 		t.Fatalf("start dart server: %v", err)
