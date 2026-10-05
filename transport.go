@@ -125,12 +125,14 @@ func (t *Transport) Dial(ctx context.Context, raddr ma.Multiaddr, p peer.ID) (tp
 	//     later punch to a different port.
 	//   - A dial to the listener's own address, which would make the
 	//     socket dial itself.
+	//   - A dial to a non-loopback address when the only listener is bound
+	//     to loopback. A loopback socket cannot send to other addresses.
 	var mux *udx.Multiplexer
 	var localMaddr ma.Multiaddr
 	simOpen, _, _ := network.GetSimultaneousConnect(ctx)
 	forceDirect, _ := network.GetForceDirectDial(ctx)
 	if simOpen || !forceDirect {
-		if l := t.listenerFor(udpNetwork); l != nil && !l.isOwnAddr(remoteAddr) {
+		if l := t.listenerFor(udpNetwork, remoteAddr); l != nil {
 			mux, localMaddr = l.mux, l.laddr
 		}
 	}
@@ -226,17 +228,36 @@ func (t *Transport) Listen(laddr ma.Multiaddr) (tpt.Listener, error) {
 	return t.upgrader.UpgradeGatedMaListener(t, raw), nil
 }
 
-// listenerFor returns an open listener on the given UDP network ("udp4" or
-// "udp6"), or nil if there is none.
-func (t *Transport) listenerFor(udpNetwork string) *rawListener {
+// listenerFor returns the listener whose socket a dial to remote on the
+// given UDP network ("udp4" or "udp6") leaves from, or nil if none fits.
+// A listener on the unspecified address is preferred. Otherwise the most
+// recent listener that can send to remote is used. A listener is not used
+// for a dial to its own address.
+func (t *Transport) listenerFor(udpNetwork string, remote *net.UDPAddr) *rawListener {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	var fallback *rawListener
 	for _, l := range t.listeners {
-		if l.network == udpNetwork {
+		if l.network != udpNetwork || l.isOwnAddr(remote) {
+			continue
+		}
+		local, ok := l.mux.Addr().(*net.UDPAddr)
+		if !ok || !canSendFrom(local.IP, remote.IP) {
+			continue
+		}
+		if local.IP.IsUnspecified() {
 			return l
 		}
+		fallback = l
 	}
-	return nil
+	return fallback
+}
+
+// canSendFrom reports whether a socket bound to local can send to remote.
+// A socket bound to loopback can send only to loopback addresses. On macOS
+// a send to another address fails with EADDRNOTAVAIL.
+func canSendFrom(local, remote net.IP) bool {
+	return !local.IsLoopback() || remote.IsLoopback()
 }
 
 // removeListener forgets a closed listener.
